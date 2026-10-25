@@ -9,6 +9,7 @@ import numpy as np
 from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors  # vectors.calc_dihedral
 from openmm import LocalEnergyMinimizer, Platform, VerletIntegrator, unit
 from openmm.app import CutoffNonPeriodic, ForceField, PDBFile, Simulation
+from scipy.optimize import least_squares
 
 from .data import unprocessed_atoms, atomic_types, at_types_lookup, N_TERMINUS, C_TERMINUS
 
@@ -28,7 +29,10 @@ CHARGE_RULES = [
 ]
 HISTIDINE_RING = ("CE1", "CD2", "ND1", "NE2")
 SS_BRIDGE_DISTANCE = 2.2  # Å
-AMBER_TOLERANCE = 10  # kJ/mol/nm, RMS force at which the AMBER minimization stops
+# Bond length (Å) and bond angles (°) closing the proline ring, which are not covered by the parameters,
+# means of 92 prolines of GFN-FF optimized structures (std 0.004 Å, 0.6° and 1.2°)
+PROLINE_RING_CLOSURE = {"CD-N": 1.486, "CG-CD-N": 105.9, "CD-N-CA": 110.9}
+AMBER_TOLERANCE = 5  # kJ/mol/nm, RMS force at which the AMBER minimization stops
 AMBER_FORCE_FIELD = ("amber19-all.xml", "implicit/gbn2.xml")  # AMBER19 with GBn2 implicit water
 AMBER_CUTOFF = 1.0  # nm, cutoff of nonbonded interactions in the AMBER minimization
 # Protonation variants of AMBER residue templates, used for residues without a template (e.g. TYR-, neutral ARG)
@@ -178,6 +182,7 @@ class Protein:
             self._place_atoms_with_neighbor_ancestors(parameters, ["C", "N"])
             self._place_atoms_with_neighbor_ancestors(parameters, ["O", "H"])
             self._place_terminal_atoms(parameters)
+            self._close_proline_rings(parameters)
         print("ok")
 
     def _amber_optimize(self, only_hydrogens, tolerance=AMBER_TOLERANCE):
@@ -208,7 +213,8 @@ class Protein:
         if len(atoms) != len(positions):
             exit("error AMBER optimization: different number of atoms in OpenMM and Biopython structures")
         for atom, position in zip(atoms, positions):
-            atom.coord = position.astype(atom.coord.dtype)
+            # in place: atom.coord is a view into the array of the internal coordinates, which are recomputed below
+            atom.coord[:] = position
         with _quiet_biopython():
             self.structure.atom_to_internal_coordinates()
         print("ok")
@@ -359,6 +365,46 @@ class Protein:
             ready = {atom for atom in remaining if not ancestors[atom] & remaining}
             self._place_atoms(parameters, ready.__contains__)
             remaining -= ready
+
+    def _close_proline_rings(self, parameters):
+        """The proline ring is built from CA through CB and CG to CD, so the ring-closing CD-N bond is not set by
+        the internal coordinates. CG and CD are therefore moved to the closest positions which best fit the bond
+        lengths and bond angles of the ring: the parameterized ones of CG and CD and PROLINE_RING_CLOSURE for
+        the CD-N bond. The hydrogens of the ring (HB, HG, HD and the N-terminal hydrogens) are then placed again."""
+        closed = set()
+        for residue in self.residues:
+            if residue.resname != "PRO" or not all(name in residue for name in ("N", "CA", "CB", "CG", "CD")):
+                continue
+            n, ca, cb, cg, cd = (residue[name] for name in ("N", "CA", "CB", "CG", "CD"))
+            if cg not in self.atom_types or cd not in self.atom_types:
+                continue
+            cg_parameters = parameters["PRO"][self.atom_types[cg]]
+            cd_parameters = parameters["PRO"][self.atom_types[cd]]
+            fixed = {"N": n.coord.astype(float), "CA": ca.coord.astype(float), "CB": cb.coord.astype(float)}
+            lengths = [("CB", "CG", cg_parameters["bond_length"][0]), ("CG", "CD", cd_parameters["bond_length"][0]),
+                       ("CD", "N", PROLINE_RING_CLOSURE["CD-N"])]
+            angles = [("CA", "CB", "CG", cg_parameters["bond_angle"][0]),
+                      ("CB", "CG", "CD", cd_parameters["bond_angle"][0]),
+                      ("CG", "CD", "N", PROLINE_RING_CLOSURE["CG-CD-N"]),
+                      ("CD", "N", "CA", PROLINE_RING_CLOSURE["CD-N-CA"])]
+
+            def residuals(x):
+                coords = fixed | {"CG": x[:3], "CD": x[3:]}
+                # 0.01 Å of a bond length is weighted as 1° of a bond angle
+                return ([100 * (np.linalg.norm(coords[a] - coords[b]) - length) for a, b, length in lengths] +
+                        [self._angle(coords[a], coords[b], coords[c]) - angle for a, b, c, angle in angles])
+
+            x = least_squares(residuals, np.concatenate([cg.coord, cd.coord]).astype(float)).x
+            cg.coord, cd.coord = x[:3], x[3:]
+            closed.add(residue)
+        self._place_atoms(parameters, lambda atom: atom.get_parent() in closed and atom.element == "H"
+                          and (atom.name[:2] in ("HB", "HG", "HD") or self.terminal_atoms.get(atom) == N_TERMINUS))
+
+    @staticmethod
+    def _angle(a1, a2, a3):
+        """Bond angle a1-a2-a3 in degrees."""
+        v1, v2 = a1 - a2, a3 - a2
+        return np.degrees(np.arccos(np.clip(np.dot(v1, v2) / np.linalg.norm(v1) / np.linalg.norm(v2), -1, 1)))
 
     def _place_atoms(self, parameters, select):
         """Place the selected atoms directly from their ancestors. The dihedral angle is set to the closest

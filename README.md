@@ -57,6 +57,8 @@ Once the virtual environment is created and activated, no further installation i
 
 `--only_hydrogens`               Preoptimize only hydrogen atoms, positions of all other atoms are kept.
 
+`--noopt`                        Skip the short AMBER optimization (OpenMM) that is run before the preoptimization.
+
 ### Arguments for `--mode parameterize`
 
 `--proteins_directory DIR`       Directory with protein structures (`*.pdb` files) used to calculate the parameters (required).
@@ -73,6 +75,8 @@ In the `preoptimize` mode, PROPTIMUS PREOPTIMER sets the bond lengths, bond angl
 
 Ready-to-use parameters derived from structures optimized with the [GFN-FF](https://onlinelibrary.wiley.com/doi/10.1002/anie.202004239) force field are available in the `parameters` directory as `parameters/GFN-FF_parameters.json`.
 
+Before the preoptimization itself, a short AMBER optimization is run with [OpenMM](https://openmm.org/) (AMBER19 force field with GBn2 implicit water). It optimizes all atoms except the CA atoms, or only the hydrogen atoms if `--only_hydrogens` is used. The minimization runs until the RMS force drops below 10 kJ/mol/nm. This step resolves overlapping atoms and steric clashes, which the internal coordinates alone cannot fix. It can be skipped with `--noopt`.
+
 With `--only_hydrogens`, only hydrogen atoms are placed. All heavy atoms stay at their original positions. Each hydrogen is placed from its ancestors with the parameterized bond length and bond angle, and with the closest dihedral cluster center (or its current dihedral angle if the dihedral is not parameterized). This mode is useful when the heavy atoms come from an experiment or from a previous optimization and only the hydrogens need to be adjusted.
 
 ### How to run
@@ -87,6 +91,12 @@ Preoptimization of hydrogen atoms only with the GFN-FF parameters (all other ato
 
 ```bash
 python preoptimer.py --mode preoptimize --input_PDB_file structure.pdb --output_PDB_file structure_preoptimized.pdb --parameters parameters/GFN-FF_parameters.json --only_hydrogens
+```
+
+Preoptimization without the preceding AMBER optimization:
+
+```bash
+python preoptimer.py --mode preoptimize --input_PDB_file structure.pdb --output_PDB_file structure_preoptimized.pdb --parameters parameters/GFN-FF_parameters.json --noopt
 ```
 
 ## Parameterization
@@ -158,7 +168,7 @@ self._assign_formal_charges()
 * `_assign_basic_atomic_types` assigns the basic atom type defined in `src/data.py` (e.g. `HB` for `HB2` and `HB3` of alanine).
 * `_assign_histidine_types` and `_assign_formal_charges` refine the basic types by appending a suffix separated by `/`, e.g. `CE1/HID` for the tautomer of histidine or `NZ/+1` for protonated lysine.
 
-To distinguish other atom types (e.g. atoms in a disulfide bridge, terminal residues or a specific environment), write another classification function and call it in `__init__` after `_assign_basic_atomic_types`. The function modifies `self.atom_types`, typically by appending a new suffix using the `_add_suffix(residue, atom_names, suffix)` helper:
+To distinguish other atom types (e.g. atoms in a disulfide bridge or a specific environment), write another classification function and call it in `__init__` after `_assign_basic_atomic_types`. The function modifies `self.atom_types`, typically by appending a new suffix using the `_add_suffix(residue, atom_names, suffix)` helper:
 
 ```python
 def _assign_my_types(self):
@@ -183,7 +193,9 @@ The definition of the basic atom types is in `src/data.py`. Each atom type is cr
 * `custom` – atoms with a single chemical bond, which are placed directly from their ancestors (outside of the Biopython internal coordinates).
 * `reverse_order` – the bond angle is stored as `atom:a2:a3` instead of `a3:a2:atom` in the Biopython internal coordinates.
 
-The backbone atom types (`HA`, `O`, `C`, `N`, `H`) are shared by all residues and are defined in the `_residue` function. Atoms listed in `unprocessed_atoms` are never typed and are kept in place.
+The backbone atom types (`HA`, `O`, `C`, `N`, `H`) are shared by all residues and are defined in the `_residue` function. Atoms listed in `unprocessed_atoms` (`CA`) are never typed and are kept in place.
+
+The atoms of the terminal residues are typed as atoms of two pseudo-residues shared by all residues, because each protein has only one N- and one C-terminus: `NTERM` (`N` and the hydrogens `H`, `H1`, `H2`, `H3` of the first residue) and `CTERM` (`C`, `O` and `OXT` of the last residue). They have their own parameters and graphs (e.g. `NTERM_H.html`) and are placed after all other atoms during preoptimization. On an N-terminal proline, one of the three positions of the NH3+ hydrogens is taken by `CD`, so its two hydrogens are placed to the remaining tetrahedral positions (dihedral angle of `CD` ± 120°).
 
 ## Testing and use cases
 

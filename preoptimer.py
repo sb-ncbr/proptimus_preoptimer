@@ -37,6 +37,11 @@ def load_arguments():
     preoptimize.add_argument('--only_hydrogens',
                              action='store_true',
                              help='Preoptimize only hydrogen atoms, positions of all other atoms are kept.')
+    preoptimize.add_argument('--noopt',
+                             action='store_true',
+                             help='Skip the short AMBER optimization (OpenMM) run before the preoptimization. '
+                                  'Without --only_hydrogens it optimizes all atoms except CA, '
+                                  'with --only_hydrogens only hydrogens.')
 
     parameterize = parser.add_argument_group('arguments for --mode parameterize')
     parameterize.add_argument('--proteins_directory',
@@ -82,7 +87,8 @@ def main():
     args = load_arguments()
     if args.mode == 'preoptimize':
         protein = Protein(args.input_PDB_file)
-        protein.preoptimize(args.parameters, only_hydrogens=args.only_hydrogens)
+        protein.preoptimize(args.parameters, only_hydrogens=args.only_hydrogens,
+                             amber_optimization=not args.noopt)
         protein.save(args.output_PDB_file)
 
     elif args.mode == 'parameterize':

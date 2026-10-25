@@ -9,10 +9,15 @@ Every atom type is described by
     n_clusters     number of clusters of (bond length, bond angle, dihedral angle); 0 = not parameterized,
     custom         atoms with a single chemical bond, placed using the closest cluster center of the dihedral,
     reverse order  the bond angle is stored as atom:a2:a3 instead of a3:a2:atom.
+
+The atoms of the N- and C-terminus are typed as atoms of the pseudo-residues N_TERMINUS and C_TERMINUS,
+shared by all residues, because each protein has only one N- and one C-terminal residue.
 """
 from collections import defaultdict
 
-unprocessed_atoms = ["CA", "OXT", "H2", "H3"]
+unprocessed_atoms = ["CA"]
+N_TERMINUS = "NTERM"
+C_TERMINUS = "CTERM"
 
 
 def _type(atoms, ancestors, n_clusters, custom=False, reverse_order=False):
@@ -221,6 +226,16 @@ atomic_types = {
         "HE1": _type("HE1", "CE1 ND1 CG", (1, 1, 1)),
         "HE2": _type("HE2", "NE2 CD2 CG", (1, 1, 0)),
     }),
+    # terminal atoms, they are placed directly from their ancestors (after the other atoms)
+    N_TERMINUS: {
+        "N": _type("N", "CA C N/+1", (1, 1, 0), custom=True),
+        "H": _type("H H1 H2 H3", "N CA C", (1, 1, 3), custom=True, reverse_order=True),
+    },
+    C_TERMINUS: {
+        "C": _type("C", "CA N C/-1", (1, 1, 0), custom=True),
+        "OXT": _type("OXT", "C CA N", (1, 1, 0), custom=True),
+        "O": _type("O", "C CA OXT", (1, 1, 1), custom=True),
+    },
 }
 
 # atom name -> atom type, for every residue

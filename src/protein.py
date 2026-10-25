@@ -7,8 +7,10 @@ from itertools import permutations
 
 import numpy as np
 from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors  # vectors.calc_dihedral
+from openmm import LocalEnergyMinimizer, Platform, VerletIntegrator, unit
+from openmm.app import CutoffNonPeriodic, ForceField, PDBFile, Simulation
 
-from .data import unprocessed_atoms, atomic_types, at_types_lookup
+from .data import unprocessed_atoms, atomic_types, at_types_lookup, N_TERMINUS, C_TERMINUS
 
 # Atom type suffixes are appended to the atom type: "<type>/<tautomer or charge>", e.g. "CE1/HID", "NZ/+1".
 # A rule is applied when all (protonated=True) or none (protonated=False) of the given hydrogens are present
@@ -26,6 +28,13 @@ CHARGE_RULES = [
 ]
 HISTIDINE_RING = ("CE1", "CD2", "ND1", "NE2")
 SS_BRIDGE_DISTANCE = 2.2  # Å
+AMBER_TOLERANCE = 10  # kJ/mol/nm, RMS force at which the AMBER minimization stops
+AMBER_FORCE_FIELD = ("amber19-all.xml", "implicit/gbn2.xml")  # AMBER19 with GBn2 implicit water
+AMBER_CUTOFF = 1.0  # nm, cutoff of nonbonded interactions in the AMBER minimization
+# Protonation variants of AMBER residue templates, used for residues without a template (e.g. TYR-, neutral ARG)
+AMBER_VARIANTS = {"ASP": ("ASP", "ASH"), "GLU": ("GLU", "GLH"), "CYS": ("CYS", "CYM", "CYX"), "LYS": ("LYS", "LYN"),
+                  "HIS": ("HIE", "HID", "HIP")}
+AMBER_BACKBONE_ATOMS = {"N", "H", "H1", "H2", "H3", "CA", "HA", "C", "O", "OXT"}
 
 # One row of the measured geometry of an atom, see Protein.get_lengths_angles
 Measurement = namedtuple("Measurement", "res_name res_id atom_name atom_type bond_length bond_angle dihedral_angle")
@@ -62,6 +71,7 @@ class Protein:
 
         # assign atomic types
         self.atom_types = {}  # atom -> atom type, only for atoms which are processed
+        self.terminal_atoms = {}  # atom -> N_TERMINUS or C_TERMINUS, for atoms typed as terminal atoms
         self._assign_basic_atomic_types()
         self._assign_histidine_types()
         self._assign_formal_charges()
@@ -82,15 +92,17 @@ class Protein:
 
         for residue in self.residues:
             res_types = at_types_lookup.get(residue.resname, {})
+            terminus = N_TERMINUS if residue is first_residue else C_TERMINUS if residue is last_residue else None
+            terminal_types = at_types_lookup.get(terminus, {})
             for atom in residue.get_atoms():
                 if atom.name in unprocessed_atoms:
                     continue
                 if residue.resname == "CYS" and atom.name == "SG":  # skip -SS- bridges
                     if len(sg_search.search(center=atom.coord, radius=SS_BRIDGE_DISTANCE, level="A")) == 2:
                         continue
-                if residue is first_residue and atom.name in ("H", "N"):
-                    continue
-                if residue is last_residue and atom.name in ("O", "C"):
+                if atom.name in terminal_types:
+                    self.atom_types[atom] = terminal_types[atom.name]
+                    self.terminal_atoms[atom] = terminus
                     continue
                 atom_type = res_types.get(atom.name)
                 if atom_type:
@@ -123,11 +135,15 @@ class Protein:
     def _base_type(self, atom):
         return self.atom_types[atom].split("/")[0]
 
+    def _type_residue(self, atom):
+        """Residue name under which the atom type is defined: the terminus for terminal atoms."""
+        return self.terminal_atoms.get(atom, atom.get_parent().resname)
+
     def _type_data(self, atom):
-        return atomic_types[atom.get_parent().resname][self._base_type(atom)]
+        return atomic_types[self._type_residue(atom)][self._base_type(atom)]
 
     def _get_ancestors_with_offsets(self, atom):
-        return _ancestors_with_offsets(atom.get_parent().resname, self._base_type(atom), atom.name)
+        return _ancestors_with_offsets(self._type_residue(atom), self._base_type(atom), atom.name)
 
     def _get_ancestors(self, atom):
         """Ancestor atom names without residue offsets."""
@@ -142,7 +158,9 @@ class Protein:
         return [self.residues[res_i + offset][name] for name, offset in zip(names, offsets)]
 
     # ---------------------------------------------------------------- preoptimization
-    def preoptimize(self, parameters_file, only_hydrogens=False):
+    def preoptimize(self, parameters_file, only_hydrogens=False, amber_optimization=True):
+        if amber_optimization:
+            self._amber_optimize(only_hydrogens)
         print("Setting bond lengths, bond angles and dihedral angles... ", end="")
         with open(parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
@@ -159,19 +177,94 @@ class Protein:
             # the already placed C(i-1). The result is therefore slightly asymmetric.
             self._place_atoms_with_neighbor_ancestors(parameters, ["C", "N"])
             self._place_atoms_with_neighbor_ancestors(parameters, ["O", "H"])
+            self._place_terminal_atoms(parameters)
         print("ok")
 
-    def _iter_typed_atoms(self, parameters):
+    def _amber_optimize(self, only_hydrogens, tolerance=AMBER_TOLERANCE):
+        """Short AMBER minimization by OpenMM in GBn2 implicit water. Only hydrogens are moved if only_hydrogens
+        is set, otherwise all atoms except CA. Fixed atoms are made massless, which the minimizer keeps in place."""
+        print("Running short AMBER optimization... ", end="", flush=True)
+        pdb = PDBFile(self.pdb_file)
+        forcefield = ForceField(*AMBER_FORCE_FIELD)
+        self._add_amber_templates_for_unmatched_residues(forcefield, pdb.topology)
+        system = forcefield.createSystem(pdb.topology, nonbondedMethod=CutoffNonPeriodic,
+                                         nonbondedCutoff=AMBER_CUTOFF * unit.nanometer, constraints=None)
+        for omm_atom in pdb.topology.atoms():
+            if only_hydrogens:
+                fixed = omm_atom.element is None or omm_atom.element.symbol != "H"
+            else:
+                fixed = omm_atom.name == "CA"
+            if fixed:
+                system.setParticleMass(omm_atom.index, 0)
+        simulation = Simulation(pdb.topology, system, VerletIntegrator(0.001),
+                                Platform.getPlatformByName("CPU"))
+        simulation.context.setPositions(pdb.positions)
+        LocalEnergyMinimizer.minimize(simulation.context, tolerance=tolerance)
+        positions = simulation.context.getState(getPositions=True).getPositions(asNumpy=True)
+        positions = positions.value_in_unit(unit.angstrom)
+
+        # OpenMM and Biopython keep the atoms in the order of the PDB file
+        atoms = list(self.structure.get_atoms())
+        if len(atoms) != len(positions):
+            exit("error AMBER optimization: different number of atoms in OpenMM and Biopython structures")
+        for atom, position in zip(atoms, positions):
+            atom.coord = position.astype(atom.coord.dtype)
+        with _quiet_biopython():
+            self.structure.atom_to_internal_coordinates()
+        print("ok")
+
+    @staticmethod
+    def _add_amber_templates_for_unmatched_residues(forcefield, topology):
+        """AMBER has no templates for some protonation states (e.g. TYR-, neutral ARG, protonated C-terminal GLU).
+        For such residues, a template is created whose atoms take the atom types and charges of the same-named
+        atoms of a reference template: backbone atoms from the standard template with the terminal prefix
+        (e.g. CGLU), side chain atoms from the protonation variant with the most similar side chain (e.g. GLH).
+        The charges are then shifted uniformly so that the residue charge is the charge of the standard template
+        minus the number of missing and plus the number of extra hydrogens."""
+        templates, residues = forcefield.generateTemplatesForUnmatchedResidues(topology)
+        for i, (template, residue) in enumerate(zip(templates, residues)):
+            chain_residues = list(residue.chain.residues())
+            prefix = "N" if residue is chain_residues[0] else "C" if residue is chain_residues[-1] else ""
+            variants = [forcefield._templates[name] for name in AMBER_VARIANTS.get(residue.name, (residue.name,))
+                        if name in forcefield._templates]
+            standard = forcefield._templates.get(prefix + residue.name)
+            if standard is None or not variants:
+                exit(f"error AMBER optimization: no template for residue {residue.name} {residue.id}")
+            side_chain = {a.name for a in template.atoms} - AMBER_BACKBONE_ATOMS
+            variants.sort(key=lambda variant: len(side_chain ^ ({a.name for a in variant.atoms}
+                                                                 - AMBER_BACKBONE_ATOMS)))
+
+            for atom in template.atoms:
+                references = [standard] + variants if atom.name in AMBER_BACKBONE_ATOMS else variants + [standard]
+                reference_atom = next((a for reference in references for a in reference.atoms
+                                       if a.name == atom.name), None)
+                if reference_atom is None:
+                    exit(f"error AMBER optimization: no atom type for atom {atom.name} "
+                         f"of residue {residue.name} {residue.id}")
+                atom.type = reference_atom.type
+                atom.parameters = dict(reference_atom.parameters)
+
+            standard_hydrogens = {a.name for a in standard.atoms if a.element.symbol == "H"}
+            hydrogens = {a.name for a in template.atoms if a.element.symbol == "H"}
+            charge = (sum(a.parameters["charge"] for a in standard.atoms)
+                      - len(standard_hydrogens - hydrogens) + len(hydrogens - standard_hydrogens))
+            shift = (round(charge) - sum(a.parameters["charge"] for a in template.atoms)) / len(template.atoms)
+            for atom in template.atoms:
+                atom.parameters["charge"] += shift
+            template.name = f"{template.name}_preoptimer_{i}"
+            forcefield.registerResidueTemplate(template)
+
+    def _iter_typed_atoms(self, parameters, skip_terminal=False):
         """Yield (residue index, residue, atom, atom parameters) for all atoms with an atom type."""
         for res_i, residue in enumerate(self.residues):
             for atom in residue.get_atoms():
-                if atom in self.atom_types:
-                    yield res_i, residue, atom, parameters[residue.resname][self.atom_types[atom]]
+                if atom in self.atom_types and not (skip_terminal and atom in self.terminal_atoms):
+                    yield res_i, residue, atom, parameters[self._type_residue(atom)][self.atom_types[atom]]
 
     def _set_internal_coordinates(self, parameters):
         """Set bond lengths, bond angles and dihedral angles of atoms whose ancestors are all in their own residue."""
         dihedrals = []
-        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
+        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters, skip_terminal=True):
             if self._has_neighbor_ancestors(atom):
                 continue
 
@@ -219,7 +312,7 @@ class Protein:
     def _place_single_bonded_atoms(self, parameters):
         """Place custom atoms (atoms with a single chemical bond) using the closest cluster center of the dihedral."""
         to_place = []
-        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
+        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters, skip_terminal=True):
             if "dihedral_angle" not in atom_parameters or self._has_neighbor_ancestors(atom):
                 continue
             if "ancestors_type" not in self._type_data(atom):
@@ -237,7 +330,7 @@ class Protein:
 
     def _place_atoms_with_neighbor_ancestors(self, parameters, atom_names):
         """Place atoms (C, N, O, H) having ancestors in the previous or the next residue."""
-        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
+        for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters, skip_terminal=True):
             if atom.name not in atom_names:
                 continue
 
@@ -253,17 +346,33 @@ class Protein:
 
     def _place_hydrogens(self, parameters):
         """Place only hydrogens, heavy atoms are kept at their original positions. The ancestors of hydrogens
-        are always heavy atoms, so the hydrogens can be placed directly in any order. The dihedral angle is set
-        to the closest cluster center, or kept from the current geometry if it is not parameterized."""
+        are always heavy atoms, so the hydrogens can be placed directly in any order."""
+        self._place_atoms(parameters, lambda atom: atom.element == "H")
+
+    def _place_terminal_atoms(self, parameters):
+        """Place the atoms of the termini directly from their ancestors. An atom is placed only after its terminal
+        ancestors, i.e. N and C first, then OXT and the hydrogens of the N-terminus, and O last."""
+        ancestors = {atom: set(self._get_ancestor_atoms(res_i, atom))
+                     for res_i, _, atom, _ in self._iter_typed_atoms(parameters) if atom in self.terminal_atoms}
+        remaining = set(ancestors)
+        while remaining:
+            ready = {atom for atom in remaining if not ancestors[atom] & remaining}
+            self._place_atoms(parameters, ready.__contains__)
+            remaining -= ready
+
+    def _place_atoms(self, parameters, select):
+        """Place the selected atoms directly from their ancestors. The dihedral angle is set to the closest
+        cluster center, or kept from the current geometry if it is not parameterized."""
         to_place = []
         for res_i, residue, atom, atom_parameters in self._iter_typed_atoms(parameters):
-            if atom.element != "H":
+            if not select(atom):
                 continue
             ancestors = self._get_ancestor_atoms(res_i, atom)
             to_place.append((res_i, atom, atom_parameters, ancestors, self._dihedral(atom, *ancestors)))
 
-        centers = self._assign_cluster_centers((res_i, atom, current, atom_parameters["dihedral_angle"])
-                                               for res_i, atom, atom_parameters, _, current in to_place
+        centers = self._assign_cluster_centers((res_i, atom, current, self._dihedral_centers(atom, atom_parameters,
+                                                                                             ancestors))
+                                               for res_i, atom, atom_parameters, ancestors, current in to_place
                                                if "dihedral_angle" in atom_parameters)
         for _, atom, atom_parameters, (A2, A3, A4), current in to_place:
             dihedral_angle = centers.get(atom, current)
@@ -271,6 +380,16 @@ class Protein:
                                                      atom_parameters["bond_length"][0],
                                                      atom_parameters["bond_angle"][0],
                                                      dihedral_angle)
+
+    def _dihedral_centers(self, atom, atom_parameters, ancestors):
+        """Cluster centers of the dihedral angle of the atom. The N-terminal hydrogens are parameterized on NH3+
+        groups, but on the N-terminal proline one of the three positions is taken by CD. Its two hydrogens are
+        therefore placed to the remaining tetrahedral positions, 120° from the dihedral angle of CD."""
+        residue = atom.get_parent()
+        if self.terminal_atoms.get(atom) == N_TERMINUS and atom.element == "H" and residue.resname == "PRO":
+            cd_dihedral = self._dihedral(residue["CD"], *ancestors)
+            return [(cd_dihedral + shift + 180) % 360 - 180 for shift in (120, -120)]
+        return atom_parameters["dihedral_angle"]
 
     def _assign_cluster_centers(self, dihedrals):
         """Assign a cluster center of the dihedral angle to each atom from (res_i, atom, current dihedral, centers).
@@ -369,6 +488,14 @@ class Protein:
                 A2, A3, A4 = self._get_ancestor_atoms(res_i, atom)
                 atom_type_data = self._type_data(atom)
                 internal_coord = residue.internal_coord
+
+                # terminal atoms are not always in the internal coordinates, they are computed from vectors
+                if atom in self.terminal_atoms:
+                    measurements.append(Measurement(
+                        self._type_residue(atom), residue.id[1], atom.name, atom_type, float(atom - A2),
+                        np.degrees(vectors.calc_angle(atom.get_vector(), A2.get_vector(), A3.get_vector())),
+                        self._dihedral(atom, A2, A3, A4)))
+                    continue
 
                 bond_length = internal_coord.get_length(f"{atom.name}:{a2}")
 

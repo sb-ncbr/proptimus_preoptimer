@@ -127,7 +127,7 @@ class Parameterization:
                     distances_in_md = np.abs(deviations) / np.nanmean(np.abs(deviations[~outliers_mask]))
                     for i in np.flatnonzero(outliers_mask):
                         pdb_file, residue, atom_name = atom_type_values["ID"][i].rsplit(",", 2)
-                        res_id = int(residue[3:])
+                        res_id = int(residue[len(residue_name):])
                         outliers[pdb_file][(res_id, residue_name)][atom_name].append((metric, values[i], center, distances_in_md[i]))
 
         units = {"bond_length": "Å", "bond_angle": "°"}

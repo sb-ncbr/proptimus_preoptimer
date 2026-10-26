@@ -3,7 +3,7 @@
 ## Description
 
 PROPTIMUS PREOPTIMER is a parameterizable tool for setting bond lengths, bond angles and dihedral angles in protein structures. 
-In the `preoptimize` mode, the internal coordinates of the atoms are set according to the parameters. 
+In the `preoptimize` mode, the bond lengths and bond angles are set by a short AMBER minimization with the equilibrium values taken from the parameters, and the hydrogen atoms are then placed according to the parameters. 
 Optionally, only the positions of hydrogen atoms can be preoptimized while all other atoms are kept in place. 
 In the `parameterize` mode, the parameters are calculated from a set of protein structures. 
 
@@ -57,7 +57,7 @@ Once the virtual environment is created and activated, no further installation i
 
 `--only_hydrogens`               Preoptimize only hydrogen atoms, positions of all other atoms are kept.
 
-`--noopt`                        Skip the short AMBER optimization (OpenMM) that is run before the preoptimization.
+`--noopt`                        Skip the short AMBER minimization (OpenMM) with the valence parameters. All atoms (only hydrogens with `--only_hydrogens`) are then placed according to the parameters of their atom types.
 
 ### Arguments for `--mode parameterize`
 
@@ -75,9 +75,11 @@ In the `preoptimize` mode, PROPTIMUS PREOPTIMER sets the bond lengths, bond angl
 
 Ready-to-use parameters derived from structures optimized with the [GFN-FF](https://onlinelibrary.wiley.com/doi/10.1002/anie.202004239) force field are available in the `parameters` directory as `parameters/GFN-FF_parameters.json`.
 
-Before the preoptimization itself, a short AMBER optimization is run with [OpenMM](https://openmm.org/) (AMBER19 force field with GBn2 implicit water). It optimizes all atoms except the CA atoms, or only the hydrogen atoms if `--only_hydrogens` is used. The minimization runs until the RMS force drops below 10 kJ/mol/nm. This step resolves overlapping atoms and steric clashes, which the internal coordinates alone cannot fix. It can be skipped with `--noopt`.
+By default, the preoptimization is a short AMBER minimization with [OpenMM](https://openmm.org/) (AMBER19 force field in vacuum), in which the equilibrium bond lengths and bond angles of the AMBER force field are replaced by the valence parameters (see [Valence parameters](#valence-parameters)) and their force constants are multiplied by 5 (`VALENCE_FORCE_SCALE` in `src/amber.py`). It optimizes all atoms except the CA atoms, with the heavy atoms harmonically restrained to their original positions (10<sup>4</sup> kJ/mol/nm<sup>2</sup>, `AMBER_RESTRAINT_FORCE_CONSTANT` in `src/protein.py`; they move by ~0.05 Å, so the valence geometry is set but the conformation is kept), or only the hydrogen atoms if `--only_hydrogens` is used, and runs until the RMS force drops below 10 kJ/mol/nm. As all bonds and angles of the topology are included (including those of hydrogens), it also sets the peptide bonds, the closures of the rings and the disulfide bridges, and it resolves overlapping atoms and steric clashes. The minimized structure is the result of the preoptimization; the dihedral angles are given by the AMBER torsions and nonbonded interactions, the dihedral cluster centers of the parameters are used only with `--noopt`.
 
-With `--only_hydrogens`, only hydrogen atoms are placed. All heavy atoms stay at their original positions. Each hydrogen is placed from its ancestors with the parameterized bond length and bond angle, and with the closest dihedral cluster center (or its current dihedral angle if the dihedral is not parameterized). This mode is useful when the heavy atoms come from an experiment or from a previous optimization and only the hydrogens need to be adjusted.
+With `--noopt`, the AMBER minimization is skipped and all atoms are placed according to the parameters of their atom types, using the Biopython internal coordinates. The ring of proline is then closed by moving `CG` and `CD`, so that the bond lengths and bond angles of the ring best fit the parameters. The peptide bonds and the disulfide bridges are not set in this mode.
+
+With `--only_hydrogens`, only hydrogen atoms are moved. All heavy atoms stay at their original positions. By default, the hydrogens are optimized by the AMBER minimization described above. With `--noopt`, each hydrogen is placed from its ancestors with the parameterized bond length and bond angle, and with the closest dihedral cluster center (or its current dihedral angle if the dihedral is not parameterized). This mode is useful when the heavy atoms come from an experiment or from a previous optimization and only the hydrogens need to be adjusted.
 
 ### How to run
 
@@ -101,7 +103,7 @@ python preoptimer.py --mode preoptimize --input_PDB_file structure.pdb --output_
 
 ## Parameterization
 
-In the `parameterize` mode, PROPTIMUS PREOPTIMER measures the bond lengths, bond angles and dihedral angles of all atoms in a set of protein structures and clusters them per atom type. The resulting cluster centers form the parameters used by the `preoptimize` mode.
+In the `parameterize` mode, PROPTIMUS PREOPTIMER measures the bond lengths, bond angles and dihedral angles of all atoms in a set of protein structures and clusters them per atom type. The resulting cluster centers form the parameters used by the `preoptimize` mode. In addition, it measures all bonds and angles of the AMBER topology of the structures, which give the valence parameters used by the AMBER minimization.
 
 ### Input structures
 
@@ -151,6 +153,7 @@ All results are stored in the directory given by `--data_dir` (it must not exist
   }
   ```
 
+* The valence parameters are stored under the `VALENCE` key, see [Valence parameters](#valence-parameters).
 * The HTML graphs show, for every atom type, the distributions of bond lengths and bond angles (histogram with a rug plot) and of dihedral angles (polar histogram). The calculated cluster centers are drawn as red lines. Hovering over the rug plot shows which structure, residue and atom a value belongs to, which is useful for checking the input data. Use `--open_browser` to open `index.html` automatically.
 * An outlier analysis (atoms with a bond length or bond angle far from the rest of the distribution) is printed to the standard output at the end of the calculation.
 
@@ -196,6 +199,25 @@ The definition of the basic atom types is in `src/data.py`. Each atom type is cr
 The backbone atom types (`HA`, `O`, `C`, `N`, `H`) are shared by all residues and are defined in the `_residue` function. Atoms listed in `unprocessed_atoms` (`CA`) are never typed and are kept in place.
 
 The atoms of the terminal residues are typed as atoms of two pseudo-residues shared by all residues, because each protein has only one N- and one C-terminus: `NTERM` (`N` and the hydrogens `H`, `H1`, `H2`, `H3` of the first residue) and `CTERM` (`C`, `O` and `OXT` of the last residue). They have their own parameters and graphs (e.g. `NTERM_H.html`) and are placed after all other atoms during preoptimization. On an N-terminal proline, one of the three positions of the NH3+ hydrogens is taken by `CD`, so its two hydrogens are placed to the remaining tetrahedral positions (dihedral angle of `CD` ± 120°).
+
+### Valence parameters
+
+The valence parameters contain the equilibrium values of all bonds (`bonds`, Å) and bond angles (`angles`, °) of the AMBER topology, including the bonds and angles between residues (peptide bonds, disulfide bridges), which are not covered by the parameters of the atom types. Each value is stored as `[mean, standard deviation, number of values]` under a key composed of the atoms of the term, `<residue><offset>:<atom>` separated by `|`:
+
+```json
+"VALENCE": {
+    "bonds": {
+        "ALA:C|PRO+1:N": [1.3901, 0.0067, 507],
+        "*+1:N|ALA:C": [1.3777, 0.0054, 12879],
+        "CYX:SG|CYXx:SG": [2.0606, 0.0144, 155]
+    },
+    "angles": {
+        "ALA:C|ALA:CA|ALA:N": [110.2403, 1.1940, 12879]
+    }
+}
+```
+
+The residue is the name of the AMBER residue template (it distinguishes the termini, e.g. `NMET`, and the protonation states, e.g. `ASH`, `HIE`, `CYX`; residues without an AMBER template get names like `TYR-HH`), the offset is relative to the home residue of the term (the residue of the central atom of an angle, the first residue of a bond): empty for the home residue, `+1`/`-1` for the sequence neighbours and `x` for other residues. Each term is stored under keys of three levels: with all residues specified (`ALA:C|PRO+1:N`), with the other residues replaced by `*` (`*+1:N|ALA:C`), and in addition with the home residue given by its residue name regardless of the template (`*+1:N|~ALA:C`). The preoptimization uses the most specific key available. Keys with fewer than 20 values (`MIN_VALENCE_SAMPLES` in `src/parameterization.py`) are not stored, and terms without any key keep their AMBER values.
 
 ## Testing and use cases
 

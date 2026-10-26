@@ -2,8 +2,6 @@ import argparse
 from pathlib import Path
 
 from src.protein import Protein
-from src.make_html_graphs import make_html_graphs
-from src.parameterization import Parameterization
 
 
 def load_arguments():
@@ -39,9 +37,10 @@ def load_arguments():
                              help='Preoptimize only hydrogen atoms, positions of all other atoms are kept.')
     preoptimize.add_argument('--noopt',
                              action='store_true',
-                             help='Skip the short AMBER optimization (OpenMM) run before the preoptimization. '
-                                  'Without --only_hydrogens it optimizes all atoms except CA, '
-                                  'with --only_hydrogens only hydrogens.')
+                             help='Skip the short AMBER minimization (OpenMM) with the valence parameters, which '
+                                  'sets the bond lengths and bond angles of all atoms except CA (only of hydrogens '
+                                  'with --only_hydrogens). All atoms are then placed according to the parameters '
+                                  'of their atom types.')
 
     parameterize = parser.add_argument_group('arguments for --mode parameterize')
     parameterize.add_argument('--proteins_directory',
@@ -92,6 +91,9 @@ def main():
         protein.save(args.output_PDB_file)
 
     elif args.mode == 'parameterize':
+        from src.make_html_graphs import make_html_graphs
+        from src.parameterization import Parameterization
+
         data_dir = Path(args.data_dir)
         data_dir.mkdir(parents=True)
         parameterization = Parameterization(args.proteins_directory, str(data_dir / 'parameters.json'),

@@ -7,10 +7,11 @@ from itertools import permutations
 
 import numpy as np
 from Bio.PDB import PDBIO, PDBParser, NeighborSearch, Superimposer, vectors  # vectors.calc_dihedral
-from openmm import LocalEnergyMinimizer, Platform, VerletIntegrator, unit
-from openmm.app import CutoffNonPeriodic, ForceField, PDBFile, Simulation
-from scipy.optimize import least_squares
+from openmm import CustomExternalForce, LocalEnergyMinimizer, Platform, VerletIntegrator, unit
+from openmm.app import Simulation
 
+from .amber import (AMBER_VACUUM_FORCE_FIELD, KEY_LEVELS, VALENCE, angle, create_amber_system,
+                    set_valence_parameters, valence_key)
 from .data import unprocessed_atoms, atomic_types, at_types_lookup, N_TERMINUS, C_TERMINUS
 
 # Atom type suffixes are appended to the atom type: "<type>/<tautomer or charge>", e.g. "CE1/HID", "NZ/+1".
@@ -29,16 +30,10 @@ CHARGE_RULES = [
 ]
 HISTIDINE_RING = ("CE1", "CD2", "ND1", "NE2")
 SS_BRIDGE_DISTANCE = 2.2  # Å
-# Bond length (Å) and bond angles (°) closing the proline ring, which are not covered by the parameters,
-# means of 92 prolines of GFN-FF optimized structures (std 0.004 Å, 0.6° and 1.2°)
-PROLINE_RING_CLOSURE = {"CD-N": 1.486, "CG-CD-N": 105.9, "CD-N-CA": 110.9}
-AMBER_TOLERANCE = 5  # kJ/mol/nm, RMS force at which the AMBER minimization stops
-AMBER_FORCE_FIELD = ("amber19-all.xml", "implicit/gbn2.xml")  # AMBER19 with GBn2 implicit water
-AMBER_CUTOFF = 1.0  # nm, cutoff of nonbonded interactions in the AMBER minimization
-# Protonation variants of AMBER residue templates, used for residues without a template (e.g. TYR-, neutral ARG)
-AMBER_VARIANTS = {"ASP": ("ASP", "ASH"), "GLU": ("GLU", "GLH"), "CYS": ("CYS", "CYM", "CYX"), "LYS": ("LYS", "LYN"),
-                  "HIS": ("HIE", "HID", "HIP")}
-AMBER_BACKBONE_ATOMS = {"N", "H", "H1", "H2", "H3", "CA", "HA", "C", "O", "OXT"}
+AMBER_TOLERANCE = 10  # kJ/mol/nm, RMS force at which the AMBER minimization stops
+# kJ/mol/nm^2, harmonic restraints of the heavy atoms (except CA) to their original positions in the AMBER
+# minimization; they move by ~0.05 Å (max ~0.3 Å), which sets the valence geometry but keeps the conformation
+AMBER_RESTRAINT_FORCE_CONSTANT = 1e4
 
 # One row of the measured geometry of an atom, see Protein.get_lengths_angles
 Measurement = namedtuple("Measurement", "res_name res_id atom_name atom_type bond_length bond_angle dihedral_angle")
@@ -163,11 +158,15 @@ class Protein:
 
     # ---------------------------------------------------------------- preoptimization
     def preoptimize(self, parameters_file, only_hydrogens=False, amber_optimization=True):
-        if amber_optimization:
-            self._amber_optimize(only_hydrogens)
-        print("Setting bond lengths, bond angles and dihedral angles... ", end="")
+        """With the AMBER optimization, the structure is the result of the AMBER minimization with the valence
+        parameters, which moves all atoms except CA (only hydrogens with only_hydrogens). Without it, all atoms
+        (only hydrogens with only_hydrogens) are placed according to the parameters of their atom types."""
         with open(parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
+        if amber_optimization:
+            self._amber_optimize(parameters, only_hydrogens)
+            return
+        print("Setting bond lengths, bond angles and dihedral angles... ", end="")
         if only_hydrogens:
             self._place_hydrogens(parameters)
         else:
@@ -185,15 +184,26 @@ class Protein:
             self._close_proline_rings(parameters)
         print("ok")
 
-    def _amber_optimize(self, only_hydrogens, tolerance=AMBER_TOLERANCE):
-        """Short AMBER minimization by OpenMM in GBn2 implicit water. Only hydrogens are moved if only_hydrogens
-        is set, otherwise all atoms except CA. Fixed atoms are made massless, which the minimizer keeps in place."""
+    def _amber_optimize(self, parameters, only_hydrogens, tolerance=AMBER_TOLERANCE):
+        """Short AMBER minimization by OpenMM in vacuum, with the equilibrium bond lengths and bond angles replaced
+        by the valence parameters. Only hydrogens are moved if only_hydrogens is set, otherwise all atoms except CA,
+        with the heavy atoms harmonically restrained to their original positions. Fixed atoms are made massless,
+        which the minimizer keeps in place."""
         print("Running short AMBER optimization... ", end="", flush=True)
-        pdb = PDBFile(self.pdb_file)
-        forcefield = ForceField(*AMBER_FORCE_FIELD)
-        self._add_amber_templates_for_unmatched_residues(forcefield, pdb.topology)
-        system = forcefield.createSystem(pdb.topology, nonbondedMethod=CutoffNonPeriodic,
-                                         nonbondedCutoff=AMBER_CUTOFF * unit.nanometer, constraints=None)
+        if VALENCE not in parameters:
+            exit(f"error AMBER optimization: the parameters contain no valence parameters ({VALENCE}), "
+                 f"calculate the parameters again or use --noopt")
+        pdb, system, template_names = create_amber_system(self.pdb_file, AMBER_VACUUM_FORCE_FIELD)
+        set_valence_parameters(system, pdb.topology, template_names, parameters[VALENCE])
+        if not only_hydrogens:
+            restraints = CustomExternalForce("0.5*k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
+            restraints.addGlobalParameter("k", AMBER_RESTRAINT_FORCE_CONSTANT)
+            for name in ("x0", "y0", "z0"):
+                restraints.addPerParticleParameter(name)
+            for omm_atom, position in zip(pdb.topology.atoms(), pdb.positions):
+                if omm_atom.element is not None and omm_atom.element.symbol != "H" and omm_atom.name != "CA":
+                    restraints.addParticle(omm_atom.index, position.value_in_unit(unit.nanometer))
+            system.addForce(restraints)
         for omm_atom in pdb.topology.atoms():
             if only_hydrogens:
                 fixed = omm_atom.element is None or omm_atom.element.symbol != "H"
@@ -213,52 +223,8 @@ class Protein:
         if len(atoms) != len(positions):
             exit("error AMBER optimization: different number of atoms in OpenMM and Biopython structures")
         for atom, position in zip(atoms, positions):
-            # in place: atom.coord is a view into the array of the internal coordinates, which are recomputed below
-            atom.coord[:] = position
-        with _quiet_biopython():
-            self.structure.atom_to_internal_coordinates()
+            atom.coord = position.astype(atom.coord.dtype)
         print("ok")
-
-    @staticmethod
-    def _add_amber_templates_for_unmatched_residues(forcefield, topology):
-        """AMBER has no templates for some protonation states (e.g. TYR-, neutral ARG, protonated C-terminal GLU).
-        For such residues, a template is created whose atoms take the atom types and charges of the same-named
-        atoms of a reference template: backbone atoms from the standard template with the terminal prefix
-        (e.g. CGLU), side chain atoms from the protonation variant with the most similar side chain (e.g. GLH).
-        The charges are then shifted uniformly so that the residue charge is the charge of the standard template
-        minus the number of missing and plus the number of extra hydrogens."""
-        templates, residues = forcefield.generateTemplatesForUnmatchedResidues(topology)
-        for i, (template, residue) in enumerate(zip(templates, residues)):
-            chain_residues = list(residue.chain.residues())
-            prefix = "N" if residue is chain_residues[0] else "C" if residue is chain_residues[-1] else ""
-            variants = [forcefield._templates[name] for name in AMBER_VARIANTS.get(residue.name, (residue.name,))
-                        if name in forcefield._templates]
-            standard = forcefield._templates.get(prefix + residue.name)
-            if standard is None or not variants:
-                exit(f"error AMBER optimization: no template for residue {residue.name} {residue.id}")
-            side_chain = {a.name for a in template.atoms} - AMBER_BACKBONE_ATOMS
-            variants.sort(key=lambda variant: len(side_chain ^ ({a.name for a in variant.atoms}
-                                                                 - AMBER_BACKBONE_ATOMS)))
-
-            for atom in template.atoms:
-                references = [standard] + variants if atom.name in AMBER_BACKBONE_ATOMS else variants + [standard]
-                reference_atom = next((a for reference in references for a in reference.atoms
-                                       if a.name == atom.name), None)
-                if reference_atom is None:
-                    exit(f"error AMBER optimization: no atom type for atom {atom.name} "
-                         f"of residue {residue.name} {residue.id}")
-                atom.type = reference_atom.type
-                atom.parameters = dict(reference_atom.parameters)
-
-            standard_hydrogens = {a.name for a in standard.atoms if a.element.symbol == "H"}
-            hydrogens = {a.name for a in template.atoms if a.element.symbol == "H"}
-            charge = (sum(a.parameters["charge"] for a in standard.atoms)
-                      - len(standard_hydrogens - hydrogens) + len(hydrogens - standard_hydrogens))
-            shift = (round(charge) - sum(a.parameters["charge"] for a in template.atoms)) / len(template.atoms)
-            for atom in template.atoms:
-                atom.parameters["charge"] += shift
-            template.name = f"{template.name}_preoptimer_{i}"
-            forcefield.registerResidueTemplate(template)
 
     def _iter_typed_atoms(self, parameters, skip_terminal=False):
         """Yield (residue index, residue, atom, atom parameters) for all atoms with an atom type."""
@@ -369,8 +335,14 @@ class Protein:
     def _close_proline_rings(self, parameters):
         """The proline ring is built from CA through CB and CG to CD, so the ring-closing CD-N bond is not set by
         the internal coordinates. CG and CD are therefore moved to the closest positions which best fit the bond
-        lengths and bond angles of the ring: the parameterized ones of CG and CD and PROLINE_RING_CLOSURE for
-        the CD-N bond. The hydrogens of the ring (HB, HG, HD and the N-terminal hydrogens) are then placed again."""
+        lengths and bond angles of the ring: the parameterized ones of CG and CD and the valence parameters of
+        the CD-N bond and its angles. This is used only without the AMBER optimization. The hydrogens of the ring (HB, HG, HD and the N-terminal hydrogens) are then placed again."""
+        from scipy.optimize import least_squares  # slow import, needed only here
+
+        def valence(kind, *atom_names):
+            return parameters[VALENCE][kind][valence_key([(None, "PRO", 0, name) for name in atom_names],
+                                                         KEY_LEVELS)][0]
+
         closed = set()
         for residue in self.residues:
             if residue.resname != "PRO" or not all(name in residue for name in ("N", "CA", "CB", "CG", "CD")):
@@ -382,29 +354,23 @@ class Protein:
             cd_parameters = parameters["PRO"][self.atom_types[cd]]
             fixed = {"N": n.coord.astype(float), "CA": ca.coord.astype(float), "CB": cb.coord.astype(float)}
             lengths = [("CB", "CG", cg_parameters["bond_length"][0]), ("CG", "CD", cd_parameters["bond_length"][0]),
-                       ("CD", "N", PROLINE_RING_CLOSURE["CD-N"])]
+                       ("CD", "N", valence("bonds", "CD", "N"))]
             angles = [("CA", "CB", "CG", cg_parameters["bond_angle"][0]),
                       ("CB", "CG", "CD", cd_parameters["bond_angle"][0]),
-                      ("CG", "CD", "N", PROLINE_RING_CLOSURE["CG-CD-N"]),
-                      ("CD", "N", "CA", PROLINE_RING_CLOSURE["CD-N-CA"])]
+                      ("CG", "CD", "N", valence("angles", "CG", "CD", "N")),
+                      ("CD", "N", "CA", valence("angles", "CD", "N", "CA"))]
 
             def residuals(x):
                 coords = fixed | {"CG": x[:3], "CD": x[3:]}
                 # 0.01 Å of a bond length is weighted as 1° of a bond angle
                 return ([100 * (np.linalg.norm(coords[a] - coords[b]) - length) for a, b, length in lengths] +
-                        [self._angle(coords[a], coords[b], coords[c]) - angle for a, b, c, angle in angles])
+                        [angle(coords[a], coords[b], coords[c]) - value for a, b, c, value in angles])
 
             x = least_squares(residuals, np.concatenate([cg.coord, cd.coord]).astype(float)).x
             cg.coord, cd.coord = x[:3], x[3:]
             closed.add(residue)
         self._place_atoms(parameters, lambda atom: atom.get_parent() in closed and atom.element == "H"
                           and (atom.name[:2] in ("HB", "HG", "HD") or self.terminal_atoms.get(atom) == N_TERMINUS))
-
-    @staticmethod
-    def _angle(a1, a2, a3):
-        """Bond angle a1-a2-a3 in degrees."""
-        v1, v2 = a1 - a2, a3 - a2
-        return np.degrees(np.arccos(np.clip(np.dot(v1, v2) / np.linalg.norm(v1) / np.linalg.norm(v2), -1, 1)))
 
     def _place_atoms(self, parameters, select):
         """Place the selected atoms directly from their ancestors. The dihedral angle is set to the closest

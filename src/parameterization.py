@@ -8,14 +8,17 @@ from tqdm import tqdm
 
 from .protein import Protein
 from .data import atomic_types
+from .amber import VALENCE, measure_valence_terms
 
 MIN_SAMPLES = 100  # minimal number of values of an atom type needed for its parameterization
+MIN_VALENCE_SAMPLES = 20  # minimal number of values of a valence term key needed for its parameterization
 
 
 def _extract_protein(pdb_file):
     """Measure one protein; returns plain tuples, so the result can be sent from a worker process."""
     protein = Protein(pdb_file, output=False)
-    return [(f"{pdb_file},{m.res_name}{m.res_id},{m.atom_name}", m) for m in protein.get_lengths_angles()]
+    return ([(f"{pdb_file},{m.res_name}{m.res_id},{m.atom_name}", m) for m in protein.get_lengths_angles()],
+            measure_valence_terms(pdb_file))
 
 
 def _run_kmeans(values, num_clusters, angular_data=False):
@@ -56,19 +59,26 @@ class Parameterization:
         self.workers = workers  # None = number of CPUs
         self.data = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
         self.parameters = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+        self.valence_data = {"bonds": defaultdict(list), "angles": defaultdict(list)}
+        self.valence_parameters = {"bonds": {}, "angles": {}}
 
     def run(self):
         self.extract_data()
         self.check_sample_sizes()
         self.calculate_parameters()
+        self.calculate_valence_parameters()
         self.save_parameters()
 
     def extract_data(self):
-        """Measure bond lengths, bond angles and dihedral angles of all proteins in the directory."""
+        """Measure bond lengths, bond angles and dihedral angles of all proteins in the directory, both per atom
+        type and per valence term (bond or angle) of the AMBER topology."""
         pdb_files = sorted(self.structures_dir.glob("*.pdb"))
         with ProcessPoolExecutor(max_workers=self.workers) as executor:
-            for protein_data in tqdm(executor.map(_extract_protein, pdb_files), total=len(pdb_files),
-                                     desc="Extracting structural data", unit="protein"):
+            for protein_data, valence_data in tqdm(executor.map(_extract_protein, pdb_files), total=len(pdb_files),
+                                                   desc="Extracting structural data", unit="protein"):
+                for kind, kind_data in valence_data.items():
+                    for key, values in kind_data.items():
+                        self.valence_data[kind][key].extend(values)
                 for atom_id, m in protein_data:
                     atom_type_data = self.data[m.res_name][m.atom_type]
                     atom_type_data["ID"].append(atom_id)
@@ -95,9 +105,17 @@ class Parameterization:
                                                       desc="Calculating parameters", unit="atom type"):
                 self.parameters[residue_name][at_type].update(result)
 
+    def calculate_valence_parameters(self, min_samples=MIN_VALENCE_SAMPLES):
+        """Mean, standard deviation and number of values of each valence term key with at least min_samples values.
+        Keys with fewer values are left out; the less specific keys of the same terms are used instead."""
+        for kind, kind_data in self.valence_data.items():
+            for key, values in sorted(kind_data.items()):
+                if len(values) >= min_samples:
+                    self.valence_parameters[kind][key] = [float(np.mean(values)), float(np.std(values)), len(values)]
+
     def save_parameters(self):
         with open(self.parameters_file, "w", encoding="utf-8") as f:
-            json.dump(self.parameters, f, ensure_ascii=False, indent=4)
+            json.dump(self.parameters | {VALENCE: self.valence_parameters}, f, ensure_ascii=False, indent=4)
 
     def find_outliers(self, gap_factor=0.5):
         print("\n\nOUTLIERS ANALYSIS:")

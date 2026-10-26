@@ -26,10 +26,9 @@ import numpy as np
 from openmm import HarmonicAngleForce, HarmonicBondForce, unit
 from openmm.app import CutoffNonPeriodic, ForceField, PDBFile
 
-AMBER_FORCE_FIELD = ("amber19-all.xml", "implicit/gbn2.xml")  # AMBER19 with GBn2 implicit water
-# AMBER19 in vacuum, used by the AMBER minimization of the preoptimization; GBn2 makes it ~10x slower
-# and the restrained minimization does not need the solvent
-AMBER_VACUUM_FORCE_FIELD = ("amber19-all.xml",)
+from . import PreoptimerError
+
+AMBER_FORCE_FIELD = "amber19-all.xml"  # AMBER19 in vacuum
 AMBER_CUTOFF = 1.0  # nm, cutoff of nonbonded interactions in the AMBER minimization
 # Protonation variants of AMBER residue templates, used for residues without a template (e.g. TYR-, neutral ARG)
 AMBER_VARIANTS = {"ASP": ("ASP", "ASH"), "GLU": ("GLU", "GLH"), "CYS": ("CYS", "CYM", "CYX"), "LYS": ("LYS", "LYN"),
@@ -42,45 +41,53 @@ KEY_LEVELS = 3
 VALENCE_FORCE_SCALE = 5
 
 
-def create_amber_system(pdb_file, force_field=AMBER_FORCE_FIELD):
-    """Return the OpenMM PDBFile, the AMBER system without constraints and the template name of each residue."""
-    pdb = PDBFile(str(pdb_file))
-    forcefield = ForceField(*force_field)
+def create_amber_system(pdb):
+    """Return the AMBER system without constraints of the OpenMM PDBFile and the template name of each residue."""
+    forcefield = ForceField(AMBER_FORCE_FIELD)
     _add_templates_for_unmatched_residues(forcefield, pdb.topology)
-    system = forcefield.createSystem(pdb.topology, nonbondedMethod=CutoffNonPeriodic,
-                                     nonbondedCutoff=AMBER_CUTOFF * unit.nanometer, constraints=None)
+    try:
+        system = forcefield.createSystem(pdb.topology, nonbondedMethod=CutoffNonPeriodic,
+                                         nonbondedCutoff=AMBER_CUTOFF * unit.nanometer, constraints=None)
+    except ValueError as error:  # e.g. a residue without a template
+        raise PreoptimerError(str(error)) from error
     template_names = [template.name for template in forcefield.getMatchingTemplates(pdb.topology)]
-    return pdb, system, template_names
+    return system, template_names
 
 
 def _add_templates_for_unmatched_residues(forcefield, topology):
     """AMBER has no templates for some protonation states (e.g. TYR-, neutral ARG, protonated C-terminal GLU).
     For such residues, a template is created whose atoms take the atom types and charges of the same-named
     atoms of a reference template: backbone atoms from the standard template with the terminal prefix
-    (e.g. CGLU), side chain atoms from the protonation variant with the most similar side chain (e.g. GLH).
-    The charges are then shifted uniformly so that the residue charge is the charge of the standard template
-    minus the number of missing and plus the number of extra hydrogens. The template is named after
-    the standard template and the missing and extra hydrogens, e.g. TYR-HH or CGLU+HE2."""
+    (e.g. CGLU; for residue names without a template, e.g. HIS, the most similar variant, e.g. CHIE),
+    side chain atoms from the protonation variant with the most similar side chain (e.g. GLH). The terminal
+    prefix is given by the unbonded backbone N (N) or C (C) atom. The charges are then shifted uniformly
+    so that the residue charge is the charge of the standard template minus the number of missing and plus
+    the number of extra hydrogens. The template is named after the standard template and the missing
+    and extra atoms, e.g. TYR-HH or CGLU+HE2, so that the same residue variant has the same name
+    in all structures."""
     templates, residues = forcefield.generateTemplatesForUnmatchedResidues(topology)
     for template, residue in zip(templates, residues):
-        chain_residues = list(residue.chain.residues())
-        prefix = "N" if residue is chain_residues[0] else "C" if residue is chain_residues[-1] else ""
-        variants = [forcefield._templates[name] for name in AMBER_VARIANTS.get(residue.name, (residue.name,))
-                    if name in forcefield._templates]
-        standard = forcefield._templates.get(prefix + residue.name)
-        if standard is None or not variants:
-            exit(f"error AMBER optimization: no template for residue {residue.name} {residue.id}")
+        bonded = {atom.name for bond in residue.external_bonds() for atom in bond[:2] if atom.residue is residue}
+        prefix = "N" if "N" not in bonded else "C" if "C" not in bonded else ""
         side_chain = {a.name for a in template.atoms} - AMBER_BACKBONE_ATOMS
-        variants.sort(key=lambda variant: len(side_chain ^ ({a.name for a in variant.atoms}
-                                                             - AMBER_BACKBONE_ATOMS)))
+        variants = sorted((forcefield._templates[name] for name in AMBER_VARIANTS.get(residue.name, (residue.name,))
+                           if name in forcefield._templates),
+                          key=lambda variant: len(side_chain ^ ({a.name for a in variant.atoms}
+                                                                - AMBER_BACKBONE_ATOMS)))
+        standard = next((forcefield._templates[name] for name in
+                         [prefix + residue.name] + [prefix + variant.name for variant in variants]
+                         if name in forcefield._templates), None)
+        if standard is None or not variants:
+            raise PreoptimerError(f"no AMBER template for residue {residue.name} {residue.id} "
+                                  f"of chain {residue.chain.id}")
 
         for atom in template.atoms:
             references = [standard] + variants if atom.name in AMBER_BACKBONE_ATOMS else variants + [standard]
             reference_atom = next((a for reference in references for a in reference.atoms
                                    if a.name == atom.name), None)
             if reference_atom is None:
-                exit(f"error AMBER optimization: no atom type for atom {atom.name} "
-                     f"of residue {residue.name} {residue.id}")
+                raise PreoptimerError(f"no AMBER atom type for atom {atom.name} of residue {residue.name} "
+                                      f"{residue.id} of chain {residue.chain.id}")
             atom.type = reference_atom.type
             atom.parameters = dict(reference_atom.parameters)
 
@@ -91,9 +98,10 @@ def _add_templates_for_unmatched_residues(forcefield, topology):
         shift = (round(charge) - sum(a.parameters["charge"] for a in template.atoms)) / len(template.atoms)
         for atom in template.atoms:
             atom.parameters["charge"] += shift
-        name = (standard.name + "".join(f"-{h}" for h in sorted(standard_hydrogens - hydrogens))
-                + "".join(f"+{h}" for h in sorted(hydrogens - standard_hydrogens)))
-        while name in forcefield._templates:  # the same hydrogens, but different heavy atoms
+        standard_atoms, atoms = {a.name for a in standard.atoms}, {a.name for a in template.atoms}
+        name = (standard.name + "".join(f"-{a}" for a in sorted(standard_atoms - atoms))
+                + "".join(f"+{a}" for a in sorted(atoms - standard_atoms)))
+        while name in forcefield._templates:  # the same atoms, but different bonds
             name += "'"
         template.name = name
         forcefield.registerResidueTemplate(template)
@@ -146,7 +154,8 @@ def _valence_terms(system, topology, template_names):
 def measure_valence_terms(pdb_file):
     """Bond lengths (Å) and bond angles (°) of all valence terms of the structure, as
     {"bonds"/"angles": {key: [values]}} with the keys of all levels."""
-    pdb, system, template_names = create_amber_system(pdb_file)
+    pdb = PDBFile(str(pdb_file))
+    system, template_names = create_amber_system(pdb)
     positions = pdb.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
     values = {"bonds": defaultdict(list), "angles": defaultdict(list)}
     for _, _, kind, tokens, indices in _valence_terms(system, pdb.topology, template_names):

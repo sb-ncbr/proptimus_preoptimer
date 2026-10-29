@@ -4,7 +4,7 @@ from pathlib import Path
 
 from src import PreoptimerError
 from src.parameterization import Parameterization
-from src.protein import Protein
+from src.preoptimization import Preoptimization
 
 
 def positive_int(value):
@@ -81,9 +81,8 @@ def main():
     args = load_arguments()
     try:
         if args.mode == 'preoptimize':
-            protein = Protein(args.input_PDB_file)
-            protein.preoptimize(args.parameters, only_hydrogens=args.only_hydrogens)
-            protein.save(args.output_PDB_file)
+            Preoptimization(args.input_PDB_file, args.parameters, args.output_PDB_file,
+                            only_hydrogens=args.only_hydrogens).run()
 
         elif args.mode == 'parameterize':
             Parameterization(args.proteins_directory, args.parameters, workers=args.workers).run()

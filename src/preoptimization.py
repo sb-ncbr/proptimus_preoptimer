@@ -15,30 +15,49 @@ AMBER_TOLERANCE = 10  # kJ/mol/nm, RMS force at which the AMBER minimization sto
 AMBER_RESTRAINT_FORCE_CONSTANT = 2e3
 
 
-class Protein:
-    def __init__(self, pdb_file):
-        print(f"Loading protein from {pdb_file}... ", end="", flush=True)
-        with open(pdb_file, "r", encoding="utf-8") as f:
-            self.pdb_lines = f.readlines()
-        self.pdb = PDBFile(str(pdb_file))
-        self.positions = self.pdb.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
-        print("ok")
+class Preoptimization:
+    def __init__(self, input_pdb_file, parameters_file, output_pdb_file, only_hydrogens=False):
+        self.input_pdb_file = input_pdb_file
+        self.parameters_file = parameters_file
+        self.output_pdb_file = output_pdb_file
+        self.only_hydrogens = only_hydrogens
+        self.valence_parameters = None
+        self.pdb_lines = None
+        self.pdb = None
+        self.positions = None  # Å, current positions of the atoms
 
-    def preoptimize(self, parameters_file, only_hydrogens=False):
-        """Short AMBER minimization by OpenMM in vacuum, with the equilibrium bond lengths and bond angles replaced
-        by the valence parameters. Only hydrogens are moved if only_hydrogens is set, otherwise all atoms except CA,
-        with the heavy atoms harmonically restrained to their original positions. Fixed atoms are made massless,
-        which the minimizer keeps in place."""
-        with open(parameters_file, "r", encoding="utf-8") as f:
+    def run(self):
+        self.load_parameters()
+        self.load_structure()
+        self.preoptimize()
+        self.save()
+
+    def load_parameters(self):
+        with open(self.parameters_file, "r", encoding="utf-8") as f:
             parameters = json.load(f)
         if VALENCE not in parameters:
             raise PreoptimerError(f"the parameters contain no valence parameters ({VALENCE}), "
                                   "calculate the parameters again")
+        self.valence_parameters = parameters[VALENCE]
+
+    def load_structure(self):
+        print(f"Loading protein from {self.input_pdb_file}... ", end="", flush=True)
+        with open(self.input_pdb_file, "r", encoding="utf-8") as f:
+            self.pdb_lines = f.readlines()
+        self.pdb = PDBFile(str(self.input_pdb_file))
+        self.positions = self.pdb.getPositions(asNumpy=True).value_in_unit(unit.angstrom)
+        print("ok")
+
+    def preoptimize(self):
+        """Short AMBER minimization by OpenMM in vacuum, with the equilibrium bond lengths and bond angles replaced
+        by the valence parameters. Only hydrogens are moved if only_hydrogens is set, otherwise all atoms except CA,
+        with the heavy atoms harmonically restrained to their original positions. Fixed atoms are made massless,
+        which the minimizer keeps in place."""
         print("Running short AMBER optimization... ", end="", flush=True)
         topology = self.pdb.topology
         system, template_names = create_amber_system(self.pdb)
-        replaced, total = set_valence_parameters(system, topology, template_names, parameters[VALENCE])
-        if not only_hydrogens:
+        replaced, total = set_valence_parameters(system, topology, template_names, self.valence_parameters)
+        if not self.only_hydrogens:
             restraints = CustomExternalForce("0.5*k*((x-x0)^2+(y-y0)^2+(z-z0)^2)")
             restraints.addGlobalParameter("k", AMBER_RESTRAINT_FORCE_CONSTANT)
             for name in ("x0", "y0", "z0"):
@@ -48,7 +67,7 @@ class Protein:
                     restraints.addParticle(omm_atom.index, position.value_in_unit(unit.nanometer))
             system.addForce(restraints)
         for omm_atom in topology.atoms():
-            if only_hydrogens:
+            if self.only_hydrogens:
                 fixed = omm_atom.element is None or omm_atom.element.symbol != "H"
             else:
                 fixed = omm_atom.name == "CA"
@@ -61,9 +80,9 @@ class Protein:
         self.positions = positions.value_in_unit(unit.angstrom)
         print(f"ok ({replaced} of {total} bonds and angles parameterized)")
 
-    def save(self, output_PDB_file):
-        print(f"Saving preoptimized protein to {output_PDB_file}... ", end="", flush=True)
-        with open(output_PDB_file, "w", encoding="utf-8") as f:
+    def save(self):
+        print(f"Saving preoptimized protein to {self.output_pdb_file}... ", end="", flush=True)
+        with open(self.output_pdb_file, "w", encoding="utf-8") as f:
             f.writelines(self._output_lines())
         print("ok\n")
 

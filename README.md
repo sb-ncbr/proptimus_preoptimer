@@ -2,15 +2,15 @@
 
 ## Description
 
-PROPTIMUS PREOPTIMER is a parameterizable tool for setting bond lengths and bond angles in protein structures. 
-In the `preoptimize` mode, the bond lengths and bond angles are set by a short AMBER minimization with the equilibrium values taken from the parameters. 
-Optionally, only the positions of hydrogen atoms can be preoptimized while all other atoms are kept in place. 
-In the `parameterize` mode, the parameters are calculated from a set of protein structures. 
+PROPTIMUS PREOPTIMER is a parameterizable tool for setting bond lengths and bond angles in protein structures.
+In the `preoptimize` mode, the bond lengths and bond angles are set by a short AMBER minimization (AMBER19 force field) with the equilibrium values taken from the parameters.
+Optionally, only the positions of hydrogen atoms can be preoptimized while all other atoms are kept in place.
+In the `parameterize` mode, the parameters are calculated from a set of protein structures.
 
 The `parameters` directory currently contains ready-to-use parameters derived from structures optimized with the [GFN-FF](https://onlinelibrary.wiley.com/doi/10.1002/anie.202004239) force field (`parameters/GFN-FF_parameters.json`).
 
 ## Getting Started
-Before running PROPTIMUS PREOPTIMER for the first time, you need to create and activate a Python virtual environment where the script will always be executed. Python 3.11 or newer is required. You can set up the virtual environment in two steps:
+Before running PROPTIMUS PREOPTIMER for the first time, you need to create and activate a Python virtual environment where the script will always be executed. Python 3.11 or newer is required. The setup consists of two steps:
 
 **1. Clone GitHub repository:**
 
@@ -19,7 +19,7 @@ git clone https://github.com/sb-ncbr/proptimus_preoptimer
 cd proptimus_preoptimer
 ```
 
-**2. Set up a virtual environment**
+**2. Set up a virtual environment:**
 
 * Create a virtual environment named `.proptimus_preoptimer_venv`:
 
@@ -65,11 +65,13 @@ Once the virtual environment is created and activated, no further installation i
 
 ## Preoptimization
 
-In the `preoptimize` mode, PROPTIMUS PREOPTIMER sets the bond lengths and bond angles of a protein structure according to the parameters. It is intended as a fast preparation step: it adjusts local geometry before a more expensive optimization, for example after adding hydrogen atoms or building missing atoms. The input structure must be protonated and use standard PDB atom names (see [Parameterization](#parameterization)). The output file is the input file with the new coordinates (all other records are kept, except ANISOU). Only the first model of the PDB file is preoptimized and saved; of alternate locations of an atom, only the first one is kept.
+In the `preoptimize` mode, PROPTIMUS PREOPTIMER sets the bond lengths and bond angles of a protein structure according to the parameters. It is intended as a fast preparation step: it adjusts local geometry before a more expensive optimization, for example after adding hydrogen atoms or building missing atoms. The input structure must be protonated and use standard PDB atom names (see [Parameterization](#parameterization)). Residues without an AMBER template (e.g. ligands, water molecules and ions) are not supported and have to be removed from the structure before the preoptimization. The output file is the input file with the new coordinates (all other records are kept, except ANISOU). Only the first model of the PDB file is preoptimized and saved; of alternate locations of an atom, only the first one is kept, with the alternate location indicator removed and the occupancy set to 1.00.
 
-The preoptimization is a short AMBER minimization with [OpenMM](https://openmm.org/) (AMBER19 force field in vacuum), in which the equilibrium bond lengths and bond angles of the AMBER force field are replaced by the valence parameters (see [Valence parameters](#valence-parameters)) and their force constants are multiplied by 5 (`VALENCE_FORCE_SCALE` in `src/amber.py`). It optimizes all atoms except the CA atoms, with the heavy atoms harmonically restrained to their original positions (2·10<sup>3</sup> kJ/mol/nm<sup>2</sup>, `AMBER_RESTRAINT_FORCE_CONSTANT` in `src/preoptimization.py`; they move by ~0.1–0.2 Å, at most ~1–3 Å at the ends of charged side chains, so the valence geometry is set but the conformation is kept), or only the hydrogen atoms if `--only_hydrogens` is used, and runs until the RMS force drops below 10 kJ/mol/nm. As all bonds and angles of the topology are included (including those of hydrogens), it also sets the peptide bonds, the closures of the rings and the disulfide bridges, and it resolves overlapping atoms and steric clashes. The minimized structure is the result of the preoptimization; the dihedral angles are given by the AMBER torsions and nonbonded interactions.
+The preoptimization is a short AMBER minimization with [OpenMM](https://openmm.org/) (AMBER19 force field in vacuum), in which the equilibrium bond lengths and bond angles of the AMBER force field are replaced by the valence parameters (see [Valence parameters](#valence-parameters)) and their force constants are multiplied by 5 (`VALENCE_FORCE_SCALE` in `src/amber.py`). The minimization runs until the RMS force drops below 10 kJ/mol/nm (`AMBER_TOLERANCE` in `src/preoptimization.py`).
 
-With `--only_hydrogens`, only hydrogen atoms are moved. All heavy atoms stay at their original positions and the hydrogens are optimized by the AMBER minimization described above. This mode is useful when the heavy atoms come from an experiment or from a previous optimization and only the hydrogens need to be adjusted.
+By default, all atoms except the CA atoms are optimized. The CA atoms are fixed and the other heavy atoms are harmonically restrained to their original positions (2·10<sup>3</sup> kJ/mol/nm<sup>2</sup>, `AMBER_RESTRAINT_FORCE_CONSTANT` in `src/preoptimization.py`). They move by ~0.1–0.2 Å, at most ~1–3 Å at the ends of charged side chains, so the valence geometry is set but the conformation is kept.
+
+With `--only_hydrogens`, only hydrogen atoms are moved. All heavy atoms are fixed at their original positions (no restraints are used) and the hydrogens are optimized by the AMBER minimization described above. This mode is useful when the heavy atoms come from an experiment or from a previous optimization and only the hydrogens need to be adjusted.
 
 ### How to run
 

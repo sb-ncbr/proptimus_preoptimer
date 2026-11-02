@@ -100,6 +100,11 @@ Preoptimization("structure.pdb", "parameters/GFN-FF_parameters.json", "structure
 
 The arguments correspond to `--input_PDB_file`, `--parameters`, `--output_PDB_file` and `--only_hydrogens`. Unlike the command line, the input files are not checked in advance and an existing output file is overwritten. Errors in the input (e.g. parameters without valence parameters) raise `src.PreoptimerError`.
 
+### Examples
+
+The `examples` directory contains example protein structures (`A4QJE9.pdb`, `P24533.pdb` and `P56641.pdb`) together with their preoptimized versions (`*_preoptimized.pdb`). 
+
+
 ## Parameterization
 
 In the `parameterize` mode, PROPTIMUS PREOPTIMER measures all bonds and bond angles of the AMBER topology of a set of protein structures. Their averages give the valence parameters (see [Valence parameters](#valence-parameters)), which are used by the AMBER minimization of the `preoptimize` mode.
@@ -145,10 +150,6 @@ The valence parameters contain the equilibrium values of all bonds (`bonds`, Å)
 ```
 
 The residue is the name of the AMBER residue template (it distinguishes the termini, e.g. `NMET`, and the protonation states, e.g. `ASH`, `HIE`, `CYX`; residues without an AMBER template get names like `TYR-HH`), the offset is relative to the home residue of the term (the residue of the central atom of an angle, the first residue of a bond): empty for the home residue, `+1`/`-1` for the sequence neighbours and `x` for other residues. Each term is stored under keys of three levels: with all residues specified (`ALA:C|PRO+1:N`), with the other residues replaced by `*` (`*+1:N|ALA:C`), and in addition with the home residue given by its residue name regardless of the template (`*+1:N|~ALA:C`). The preoptimization uses the most specific key available. Keys with too few values are not stored (see [Input structures](#input-structures)), and terms without any key keep their AMBER values.
-
-## Examples
-
-The `examples` directory contains example protein structures (`A4QJE9.pdb`, `P24533.pdb` and `P56641.pdb`) together with their preoptimized versions (`*_preoptimized.pdb`). 
 
 ## Testing and use cases
 

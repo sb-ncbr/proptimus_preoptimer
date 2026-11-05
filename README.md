@@ -3,7 +3,7 @@
 ## Description
 
 PROPTIMUS PREOPTIMER is a parameterizable tool for setting bond lengths and bond angles in protein structures.
-In the `preoptimize` mode, the bond lengths and bond angles are set by a short AMBER minimization (AMBER19 force field) with the equilibrium values taken from the parameters.
+In the `preoptimize` mode, the bond lengths and bond angles are set by a short minimization in [OpenMM](https://openmm.org/) with a modified AMBER19 force field, in which the equilibrium bond lengths and bond angles are replaced by the values from the parameters (see [Preoptimization](#preoptimization)).
 Optionally, only the positions of hydrogen atoms can be preoptimized while all other atoms are kept in place.
 In the `parameterize` mode, the parameters are calculated from a set of protein structures.
 
